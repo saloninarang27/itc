@@ -21,6 +21,7 @@ class _LoginPageState extends State<LoginPage> {
       UserCredential? usercredential;
       try{
         usercredential=await FirebaseAuth.instance.signInWithEmailAndPassword(email: email, password: password).then((value){
+          print("Match found");
           Navigator.pushReplacement(context, MaterialPageRoute(builder: (context)=>ProfilePage(gmail: email)));
         });
       }

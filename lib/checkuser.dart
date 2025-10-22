@@ -12,6 +12,7 @@ class CheckUser extends StatefulWidget {
 class _CheckUserState extends State<CheckUser> {
   checkuser() {
     final user =   FirebaseAuth.instance.currentUser;
+    print(user);
     if(user != null)
     {
       return ProfilePage(gmail: "${user.email}");

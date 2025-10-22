@@ -1,9 +1,9 @@
-
-import 'dart:io' show File;
+import 'dart:io' show File, HttpClient;
 import 'dart:typed_data';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart';
 import 'package:itc/addadmin.dart';
@@ -15,64 +15,59 @@ import 'package:flutter/material.dart';
 import 'package:itc/suggesstion.dart';
 import 'package:itc/uihelper.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
-
+import 'package:flutter/foundation.dart' show consolidateHttpClientResponseBytes, kIsWeb;
 
 class ProfilePage extends StatefulWidget {
-  const ProfilePage({super.key,required this.gmail});
+  const ProfilePage({super.key, required this.gmail});
   final String gmail;
+
   @override
   State<ProfilePage> createState() => _ProfilePageState();
 }
 
 String _searchQuery = "";
 TextEditingController _searchController = TextEditingController();
+
 class _ProfilePageState extends State<ProfilePage> {
   bool _canUploadFile = true;
-  String ?fname;
+  String? fname;
+  bool _isUploading = false; // 🔹 New variable for upload loader
+
+  // Local pagination
+  final int _limit = 20;
+  List<Map<String, dynamic>> _allRows = [];
+  List<Map<String, dynamic>> _visibleRows = [];
+  int _currentPage = 0;
+  bool _isLoading = false;
+
   @override
   void initState() {
     super.initState();
     _checkUserRole();
+    _loadExcelData(); // fetch Excel from Storage
   }
 
+  // 🔹 Show details
   void _showItemDetails(Map<String, dynamic> data) {
     showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: Text(data['Material Description'] ?? 'No Name'),
+          title: Text(data['Material Description'] ?? 'No Description'),
           content: Column(
             mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              ListTile(
-                title: Text('Line Name'),
-                subtitle: Text(data['Line Name'] ?? '#ERROR!'),
-              ),
-              ListTile(
-                title: Text('Location'),
-                subtitle: Text(data['Location'] ?? 'A-R-2'),
-              ),
-              ListTile(
-                title: Text('Material Description'),
-                subtitle: Text(data['Material Description'] ?? 'LER-CODING UNIT 2371507901'),
-              ),
-              ListTile(
-                title: Text('Material No'),
-                subtitle: Text(data['Material No'] ?? '61009204'),
-              ),
-              ListTile(
-                title: Text('Qty'),
-                subtitle: Text(data['Qty'] ?? '#REF!'),
-              ),
+            children: [
+              _detailTile('Material No', data['Material No']),
+              _detailTile('Material Description', data['Material Description']),
+              _detailTile('Location', data['Location']),
+              _detailTile('Qty', data['Qty']),
+              _detailTile('Line Name', data['Line Name']),
             ],
           ),
-          actions: <Widget>[
+          actions: [
             TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: Text('Close'),
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
             ),
           ],
         );
@@ -80,131 +75,206 @@ class _ProfilePageState extends State<ProfilePage> {
     );
   }
 
+  Widget _detailTile(String title, String? value) {
+    return ListTile(
+      title: Text(title),
+      subtitle: Text(value ?? 'N/A'),
+    );
+  }
+
+  // 🔹 Check role
   Future<void> _checkUserRole() async {
     try {
-      var userDoc = await FirebaseFirestore.instance.collection('Users').doc(
-          widget.gmail).get();
+      var userDoc = await FirebaseFirestore.instance
+          .collection('Users')
+          .doc(widget.gmail)
+          .get();
+
       if (userDoc.exists) {
-        // setState(() {
-        //   fname=userDoc.data()?['FirstName']+" "+userDoc.data()?['LastName'];
-        // });
         setState(() {
-          fname=userDoc.data()?['First Name']+" "+userDoc.data()?['Last Name'];
-        });
-        var role = userDoc.data()?['Role'];
-        if (role == 'Employee') {
-          print("Employee");
-          setState(() {
+          fname =
+          "${userDoc.data()?['First Name']} ${userDoc.data()?['Last Name']}";
+          if (userDoc.data()?['Role'] == 'Employee') {
             _canUploadFile = false;
-          });
-        } else {
-          print("Admin");
-        }
+          }
+        });
       } else {
         await FirebaseAuth.instance.signOut();
         UiHelper.CustomAlertBox(context, "You are not a user now!!");
-        // thik h ?
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (context) => LoginPage()),
         );
       }
     } catch (e) {
-      print("Error fetching user role: $e");
+      print("Error checking user role: $e");
     }
   }
 
+  // 🔹 Request permission
   Future<void> _requestPermission() async {
     if (!kIsWeb) {
       var status = await Permission.storage.status;
-      if (status.isDenied) {
-        status = await Permission.storage.request();
-      }
-      if (status.isPermanentlyDenied) {
-        openAppSettings();
-      }
+      if (status.isDenied) await Permission.storage.request();
+      if (status.isPermanentlyDenied) openAppSettings();
     }
   }
 
-  Future<void> _deleteExistingData() async {
-    var collection = FirebaseFirestore.instance.collection('excelData');
-    var snapshots = await collection.get();
-    for (var doc in snapshots.docs) {
-      await doc.reference.delete();
-    }
-  }
-
+  // 🔹 Upload Excel file to Firebase Storage
   Future<void> _uploadFile() async {
     await _requestPermission();
 
-    // Pick file
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['xlsx'],
     );
 
-    if (result != null && result.files.isNotEmpty) {
-      // Delete existing data
-      await _deleteExistingData();
+    if (result == null || result.files.first.path == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('No file selected')));
+      return;
+    }
 
-      // Get the file
-      PlatformFile file = result.files.first;
+    File file = File(result.files.first.path!);
 
-      // Read the file bytes
-      Uint8List? fileBytes;
-      if (kIsWeb) {
-        fileBytes = file.bytes;
-      } else {
-        if (file.path != null) {
-          File fileFromPath = File(file.path!!);
-          fileBytes = await fileFromPath.readAsBytes();
-        }
-      }
+    try {
+      // 🔹 Show upload loader
+      setState(() {
+        _isUploading = true;
+      });
 
-      // Ensure the file has bytes
-      if (fileBytes != null) {
-        // Read the file
-        var excel = Excel.decodeBytes(fileBytes);
+      // Upload task with progress monitoring
+      final uploadTask = FirebaseStorage.instance
+          .ref('excel_files/trackstar_data.xlsx')
+          .putFile(file);
 
-        // Iterate over the sheets
-        for (var table in excel.tables.keys) {
-          var sheet = excel.tables[table];
-          List<String> columnNames = sheet!.rows.first.map((cell) =>
-          cell?.value.toString() ?? '').toList();
+      // Optional: Listen to upload progress
+      uploadTask.snapshotEvents.listen((taskSnapshot) {
+        final progress = (taskSnapshot.bytesTransferred / taskSnapshot.totalBytes) * 100;
+        print('Upload progress: ${progress.toStringAsFixed(2)}%');
+      });
 
-          for (var row in sheet.rows.skip(1)) {
-            // Create a map for Firestore
-            Map<String, dynamic> data = {};
-            for (var i = 0; i < row.length; i++) {
-              data[columnNames[i]] = row[i]?.value.toString() ?? '';
-            }
+      // Wait for upload to complete
+      await uploadTask;
 
-            // Upload the data to Firestore
-            await FirebaseFirestore.instance.collection('excelData').add(data);
-          }
-        }
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Excel uploaded successfully!')));
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Data uploaded successfully')),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('File bytes are null')),
-        );
-      }
-    } else {
-      // User canceled the picker
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('No file selected')),
-      );
+      // Reload data after upload
+      await _loadExcelData();
+
+    } catch (e) {
+      print('Upload error: $e');
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Upload error: $e')));
+    } finally {
+      // 🔹 Hide upload loader
+      setState(() {
+        _isUploading = false;
+      });
     }
   }
 
-  Future<List<Map<String, dynamic>>> _fetchAllData() async {
-    QuerySnapshot querySnapshot = await FirebaseFirestore.instance.collection(
-        'excelData').get();
-    return querySnapshot.docs.map((doc) => doc.data() as Map<String, dynamic>)
-        .toList();
+  Future<void> _loadExcelData() async {
+    setState(() {
+      _isLoading = true;
+      _allRows.clear();
+      _visibleRows.clear();
+      _currentPage = 0;
+    });
+
+    try {
+      // Get download URL instead of using getData()
+      String downloadURL = await FirebaseStorage.instance
+          .ref('excel_files/trackstar_data.xlsx')
+          .getDownloadURL();
+
+      // For web, use http package to fetch the file
+      if (kIsWeb) {
+        final response = await HttpClient().getUrl(Uri.parse(downloadURL));
+        final httpRequest = await response.close();
+        final data = await consolidateHttpClientResponseBytes(httpRequest);
+        _processExcelData(data);
+      } else {
+        // For mobile, use the existing approach
+        Uint8List? data = await FirebaseStorage.instance
+            .ref('excel_files/trackstar_data.xlsx')
+            .getData();
+        if (data != null) {
+          _processExcelData(data);
+        }
+      }
+    } catch (e) {
+      print('Error loading Excel: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Upload Excel Data')),
+      );
+    }
+
+    setState(() {
+      _isLoading = false;
+    });
+  }
+
+  // Helper method to process Excel data
+  void _processExcelData(Uint8List data) {
+    var excel = Excel.decodeBytes(data);
+    _allRows.clear();
+
+    for (var table in excel.tables.keys) {
+      var sheet = excel.tables[table];
+      if (sheet == null || sheet.rows.isEmpty) continue;
+
+      List<String> headers =
+      sheet.rows.first.map((cell) => cell?.value.toString() ?? '').toList();
+
+      for (var row in sheet.rows.skip(1)) {
+        Map<String, dynamic> rowData = {};
+        for (var i = 0; i < headers.length && i < row.length; i++) {
+          rowData[headers[i]] = row[i]?.value?.toString() ?? '';
+        }
+        _allRows.add(rowData);
+      }
+    }
+
+    _applyPagination();
+  }
+
+  // 🔹 Apply pagination
+  void _applyPagination() {
+    final start = _currentPage * _limit;
+    final end = start + _limit;
+    final newPage = _allRows.sublist(
+        start, end > _allRows.length ? _allRows.length : end);
+
+    setState(() {
+      if (_currentPage == 0) {
+        _visibleRows = newPage;
+      } else {
+        _visibleRows.addAll(newPage);
+      }
+    });
+  }
+
+  // 🔹 Load next page
+  void _loadNextPage() {
+    if ((_currentPage + 1) * _limit >= _allRows.length) return;
+    _currentPage++;
+    _applyPagination();
+  }
+
+  // 🔹 Filtered rows based on search
+  List<Map<String, dynamic>> get _filteredRows {
+    if (_searchQuery.isEmpty) return _visibleRows;
+
+    return _allRows.where((data) {
+      final materialNo =
+      (data['Material No'] ?? '').toString().toLowerCase();
+      final description =
+      (data['Material Description'] ?? '').toString().toLowerCase();
+      return materialNo.contains(_searchQuery) ||
+          description.contains(_searchQuery);
+    }).toList();
   }
 
   @override
@@ -212,7 +282,7 @@ class _ProfilePageState extends State<ProfilePage> {
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Colors.orange,
-        title: Text("TrackStar"),
+        title: const Text("TrackStar"),
         centerTitle: true,
       ),
       drawer: Drawer(
@@ -222,90 +292,71 @@ class _ProfilePageState extends State<ProfilePage> {
           children: [
             DrawerHeader(
               child: Column(
-                children: [
-
+                children: const [
                   CircleAvatar(
                     backgroundImage: AssetImage('lib/images/logo.jpg'),
-                    radius: 50.0, // Adjust the radius as needed
+                    radius: 50.0,
                   ),
-                  //   "${name}", style: TextStyle(fontSize: 16.0, fontWeight: FontWeight.bold, color: Colors.black,),),
                 ],
               ),
             ),
-            //SizedBox(height: 35,),
             if (_canUploadFile)
               ListTile(
-                leading: Icon(Icons.add_box_outlined),
-                title: Text('Add Admins'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (context) => AddAdmin()),
-                  );
-
-                },
+                leading: const Icon(Icons.add_box_outlined),
+                title: const Text('Add Admins'),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => AddAdmin()),
+                ),
               ),
             if (_canUploadFile)
               ListTile(
-                leading: Icon(Icons.remove),
-                title: Text('Remove Admins'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (context) => Remove(role: "Admin")),
-                  );
-                },
+                leading: const Icon(Icons.remove),
+                title: const Text('Remove Admins'),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => Remove(role: "Admin")),
+                ),
               ),
             if (_canUploadFile)
               ListTile(
-                leading: Icon(Icons.add_box),
-                title: Text('Add Employee'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (context) => SignUp2()),
-                  );
-
-                },
+                leading: const Icon(Icons.add_box),
+                title: const Text('Add Employee'),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => SignUp2()),
+                ),
               ),
             if (_canUploadFile)
               ListTile(
-                leading: Icon(Icons.delete),
-                title: Text('Remove Employee'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (context) => Remove(role: "Employee")),
-                  );
-                },
+                leading: const Icon(Icons.delete),
+                title: const Text('Remove Employee'),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => Remove(role: "Employee")),
+                ),
               ),
             ListTile(
-              leading: Icon(Icons.label_important_outline),
-              title: Text('Suggesstions'),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => Suggesstion(name: fname.toString())),
-                );
-              },
+              leading: const Icon(Icons.label_important_outline),
+              title: const Text('Suggestions'),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (context) =>
+                        Suggesstion(name: fname?.toString() ?? 'User')),
+              ),
             ),
             ListTile(
-              leading: Icon(Icons.change_circle_outlined),
-              title: Text('Change Password'),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => ChangePassword()),
-                );
-              },
+              leading: const Icon(Icons.change_circle_outlined),
+              title: const Text('Change Password'),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => ChangePassword()),
+              ),
             ),
             ListTile(
-              leading: Icon(Icons.logout_outlined),
-              title: Text('Logout'),
+              leading: const Icon(Icons.logout_outlined),
+              title: const Text('Logout'),
               onTap: () async {
                 await FirebaseAuth.instance.signOut();
                 Navigator.pushReplacement(
@@ -317,76 +368,113 @@ class _ProfilePageState extends State<ProfilePage> {
           ],
         ),
       ),
-      body: Column(
-        children: <Widget>[
-          if (_canUploadFile)
-            Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: ElevatedButton(
-                onPressed: _uploadFile,
-                child: Text('Upload New Excel File'),
-              ),
-            ),
-          Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: TextField(
-              controller: _searchController,
-              decoration: InputDecoration(
-                labelText: 'Search',
-                prefixIcon: Icon(Icons.search),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8.0),
+      // 🔹 Floating Action Button for upload
+      floatingActionButton: _canUploadFile
+          ? FloatingActionButton(
+        onPressed: _isUploading ? null : _uploadFile,
+        backgroundColor: Colors.orange,
+        foregroundColor: Colors.white,
+        tooltip: 'Upload Excel File',
+        child: _isUploading
+            ? const SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+            strokeWidth: 2,
+          ),
+        )
+            : const Icon(Icons.upload_file),
+      )
+          : null,
+      body: Stack( // 🔹 Use Stack to show loader overlay
+        children: [
+          Column(
+            children: [
+              // 🔹 Removed the old upload button from here
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: TextField(
+                  controller: _searchController,
+                  decoration: InputDecoration(
+                    labelText: 'Search by Material No or Description',
+                    prefixIcon: const Icon(Icons.search),
+                    border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(8.0)),
+                  ),
+                  onChanged: (value) {
+                    setState(() {
+                      _searchQuery = value.toLowerCase();
+                    });
+                  },
                 ),
               ),
-              onChanged: (value) {
-                setState(() {
-                  _searchQuery = value.toLowerCase();
-                });
-              },
-            ),
-          ),
-          Expanded(
-            child: FutureBuilder<List<Map<String, dynamic>>>(
-              future: _fetchAllData(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return Center(child: CircularProgressIndicator());
-                }
-
-                if (snapshot.hasError) {
-                  return Center(child: Text('Error: ${snapshot.error}'));
-                }
-
-                if (!snapshot.hasData || snapshot.data!.isEmpty) {
-                  return Center(child: Text('No data available'));
-                }
-
-                final allData = snapshot.data!;
-                final filteredData = allData.where((data) {
-                  final materialDescription = data['Material Description']?.toLowerCase() ?? '';
-                  final materialNo = data['Material No']?.toLowerCase() ?? '';
-                  return materialDescription.contains(_searchQuery) || materialNo.contains(_searchQuery);
-                }).toList();
-
-                return ListView.builder(
+              Expanded(
+                child: _isLoading
+                    ? const Center(child: CircularProgressIndicator())
+                    : ListView.builder(
                   padding: const EdgeInsets.all(16.0),
-                  itemCount: filteredData.length,
+                  itemCount: _filteredRows.length + 1,
                   itemBuilder: (context, index) {
-                    var data = filteredData[index];
+                    if (index == _filteredRows.length) {
+                      // Load more button
+                      if ((_currentPage + 1) * _limit >= _allRows.length) {
+                        return const SizedBox(); // no more
+                      }
+                      return TextButton(
+                        onPressed: _loadNextPage,
+                        child: const Text('Load More'),
+                      );
+                    }
+                    final data = _filteredRows[index];
                     return Card(
                       margin: const EdgeInsets.symmetric(vertical: 8.0),
                       child: ListTile(
-                        title: Text(data['Material Description'] ?? 'No Name'),
-                        //subtitle: Text('Category: ${data['Category'] ?? 'N/A'}'),
-                        subtitle: Text('Material No: ${data['Material No'] ?? 'N/A'}'),
+                        title:
+                        Text(data['Material Description'] ?? 'No Name'),
+                        subtitle:
+                        Text('Material No: ${data['Material No'] ?? 'N/A'}'),
                         onTap: () => _showItemDetails(data),
                       ),
                     );
                   },
-                );
-              },
-            ),
+                ),
+              ),
+            ],
           ),
+
+          // 🔹 Upload loader overlay
+          if (_isUploading)
+            Container(
+              color: Colors.black54,
+              child: const Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.orange),
+                    ),
+                    SizedBox(height: 16),
+                    Text(
+                      'Uploading Excel File...',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'Please wait',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );

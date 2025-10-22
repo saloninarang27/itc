@@ -24,7 +24,7 @@ class UiHelper{
       voidCallback();
     },style:ElevatedButton.styleFrom(shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(25)
-    )),child: Text(text,style: TextStyle(color: Colors.orange,fontSize: 20),),),);
+    )),child: Text(text,style: TextStyle(color: Colors.white,fontSize: 20),),),);
   }
   static CustomAlertBox(BuildContext context,String text)
   {
